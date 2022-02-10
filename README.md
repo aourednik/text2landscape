@@ -4,7 +4,7 @@
 
 The core of this repository is an [Rmd notebook](text2landscape.Rmd) that allows you to transform a corpus of texts to a landscape by the tools of computer linguistics, statistics and data visualization packages. Download it and open it in RStudio or VSCode to experiment with the code, or to apply it to your own corpus. Forks and pull requests are welcome!
 
-[See the documentation]().
+[▸ See the DOCUMENTATION](https://ourednik.info/maps/2022/02/04/text2landscape-visualize-a-text-in-multiple-spaces-with-r-network-visualization-word-embeddings-principal-component-analysis-and-self-organizing-maps/).
 
 ![](img/network2d3d_2.png)
 
