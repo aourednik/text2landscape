@@ -31,26 +31,26 @@ ruisseau](https://www.gutenberg.org/ebooks/61697) and
 I suppose you are using RStudio and know how to install packages. Let us first load the appropriate packages and define some global variables, such as the number of cores on your computer for parallel processing and the path to which your results will be stored:
 
 ```{r}
-library(magrittr) # provides %>% pipe operator
-library(data.table) # provides an efficient data.frame model and an interesting short-hand syntax
-library(stringdist) # for detecting word flexions
+library(magrittr) # %>% pipe operator
+library(data.table) # efficient data.frame model and shorthand syntax
+library(future) # explicit paralle processing
+library(stringdist) # detecting word similarities
 library(quanteda)
 library(quanteda.textstats)
 library(quanteda.textplots)
 library(readtext)
 library(ggplot2)
-library(udpipe) # for lemmatization
+library(udpipe) # lemmatization
 library(igraph)
-library(tidygraph) # allows for manipulation of igraph objects with a coherent syntax
+library(tidygraph) # manipulation of igraph objects with a coherent syntax
 library(ggraph)
-library(particles) # for particle-based network layouts
+library(particles) # particle-based network layouts
 library(RBioFabric) # must be installed by remotes::install_github("wjrl/RBioFabric")
-library(vegan) # for efficient non-metric multidimensional scaling
+library(vegan) # efficient non-metric multidimensional scaling
 library(text2vec)
 library(fastcluster) # makes the hclust function much faster
 library(kohonen) # Self-organizing maps
-library(ggforce) # Allows to draw Voronoi tiles in any ggplot
-library(akima) # Interpolates points to a raster, allowing to create a pseudo-DEM (digital elevation model)
+library(akima) # Interpolate points to a raster -> create a pseudo-DEM (digital elevation model)
 library(rgl) # 3D grahics
 library(rayshader) # Rendered 3D graphics with raytracing
 ncores <- parallelly::availableCores() # determine the number of cores on your computer; we'll use this value in functions supporting multicore processing.
@@ -148,7 +148,7 @@ text.lemmas <- text.lemmas[
 	(doc_id =="pg61697.txt" & sentence_id > 21 & sentence_id < 1472) |
 	(doc_id =="pg40456.txt" & sentence_id > 18 & sentence_id < 219)
 ] 
-text.lemmas[,c("sentence_id","token","lemma","upos")] %>% head(30) 
+text.lemmas[,c("doc_id","sentence_id","token","lemma","upos")] %>% head(30) 
 ```
 
 ------------- ------------- -------------- -------------- -------
@@ -248,66 +248,71 @@ entry](https://en.wikipedia.org/wiki/Jaro%E2%80%93Winkler_distance) or
 at a [paper from 1990](https://files.eric.ed.gov/fulltext/ED325505.pdf)
 worthwhile for its retro aesthetics.
 
-Let us calculate the Jaro distance for all words accounted for in the
-`wordfreqs` table:
+I've wrapped `stringdistmatrix` in the following function - `flexionsf` - to calculate the Jaro distance for any vector of words, store it in a matrix (`tokdist`) and use it to generate a list of flexions for every word that has any. The function also explicitly detects plural flexion and capitalized versions. `flexionsf` is self-standing and I imagine you will find ways to reuse it elsewhere. Beware: it is designed for French, here, so plurals are assumed to take an -s or an -x; adapt as needed for your language.
+
+When digesting less than 10k words, this function takes up to a minute on an M1 Silicon chip with 10 cores, so you may need to fetch a coffee while running it; and do save the result to your hard drive!
 
 ```{r}
-tokens.dissimilarity <- stringdist::stringdistmatrix(wordfreqs$feature,nthread=ncores, method="jw")
-names(tokens.dissimilarity) <- wordfreqs$feature
-tokens.dissimilarity.df <- tokens.dissimilarity %>% as.matrix %>% Matrix::forceSymmetric(., uplo="U") %>% as.matrix %>% as.data.frame
+flexionsf <- function(words,d){ # xraw is the named symmetric distance matrix, d is the maximum distance at which words are considered as synonyms.
+	tokdist <- stringdist::stringdistmatrix(words,method="jw",nthread=ncores) %>% as.matrix %>% Matrix::forceSymmetric(., uplo="U")
+	rownames(tokdist) <- words
+	colnames(tokdist) <- words
+	tokdist <- tokdist[grepl("^[[:lower:]]", rownames(tokdist)),] # Do not add word as key to the dictionary if it is capitalized
+	cnslc <- tolower(colnames(tokdist))
+	nchars <- nchar(colnames(tokdist))
+	spldf <- split(tokdist %>% as.matrix %>% as.data.frame, seq(1, nrow(tokdist), by = floor(nrow(tokdist)/(ncores-1)))) # generates a warning, but is OK. Try c(1,2,3,4,5) %>% split(seq(1, 5, by = 2)) to understand why
+	plan(multisession)
+	temp <- future_lapply(spldf, function(x) {
+		lapply(rownames(x), function(w) { # w is the current word
+			selector <- unname(
+				(x[w,] < d | w == cnslc | paste0(w,"s") == cnslc | paste0(w,"x") == cnslc) & 
+				nchar(w) <= nchars # only add flexions that are longer than the current dictionary key
+			)#[1,]
+			if ( length(selector[selector]) > 1 ) { # only add the word if it has more than one flexion; selector[selector] gives the vector of TRUE elements
+				return(colnames(x)[selector])
+			} else {
+				return(NULL)
+			}
+		})
+	}) %>% unlist(recursive=FALSE)
+	future:::ClusterRegistry("stop")
+	temp <- temp[!sapply(temp, is.null)]
+	names(temp) <- sapply(temp,function(i) i[1])
+	temp <- temp[grepl("^[[:lower:]]", names(temp))] # why do I have to repeat this ?
+	lapply(temp, function(i) i[-1]) # remove first entry to not repeat key in entries
+}
 ```
 
-Once I have the `tokens.dissimilarity` matrix, I feed it to a convenience function `flexionsf` that generates a list of flexions for every word that has any. This function takes a long time, so fetch a coffee while running it and save the result to your hard drive!
-
+Let us apply the function to all words accounted for in the `wordfreqs` table:
+ 
 ```{r}
-
-flexionsf <- function(x,d,take=nrow(x)){ # x is the named symmetric distance matrix, d is the maximum distance at which words are considered as synonyms, the take parameter is for testing purposes. It limits the fucnction to a subset of 1:take words from the distance matrix
-	nchars <- nchar(colnames(x))
-	temp <- lapply(rownames(x)[1:take], function(w) { # y is the current word
-		if(grepl("^[[:upper:]]", w)) {return(NULL)} # Do not add a key to the dictionary if it is capitalized
-		selector <- unname(
-			(x[w,] < d | w == tolower(colnames(x))) & 
-			nchar(w) <= nchars # only add words that are longer than the current dictionary key
-		)[1,]
-		if ( length(wordfreqs[selector,feature]) > 1 ) { # only add the word if it has more than one synonym 
-			return(wordfreqs[selector,feature])
-		} else {
-			return(NULL)
-		}
-	})
-	names(temp) <- rownames(x)[1:take]
-	temp[!sapply(temp, is.null)]
-}
-if(FALSE){
-	flexions.list <- flexionsf(tokens.dissimilarity.df,0.04) 
-	save(flexions.list,file=file.path(basepath,"flexions_list.RData"))
-}
-flexions.list %>% head(10)
+flexions.list <- flexionsf(wordfreqs$feature,0.04) 
+save(flexions.list,file=file.path(basepath,"flexions_list.RData"))
 ```
 
 A printout of the first 10 entires gives you an idea of what you get:
 
 ```
 $eau
-[1] "eau" "Eau"
-$montagne
-[1] "montagne"  "montagnes"
-$grand
-[1] "grand" "Grand"
-$neige
-[1] "neige" "Neige"
-$terre
-[1] "terre" "Terre"
+[1] "Eau"  "eaux"
 $roche
-[1] "roche" "Roche"
-$pierre
-[1] "pierre" "Pierre"
-$nouveau
-[1] "nouveau" "Nouveau"
-$soleil
-[1] "soleil" "Soleil"
-$descendre
-[1] "descendre"  "descendire"
+[1] "Roche"
+$cime
+[1] "CIMES"
+$forêt
+[1] "forêts"
+$dieu
+[1] "Dieu"  "dieux"
+$bois
+[1] "Bois"
+$cité
+[1] "Cité"
+$balancer
+[1] "balancier"
+$génie
+[1] "génies"
+$gonfler
+[1] "Gonfler"
 ```
 
 You can then easily transform the list of flexions to a quanteda dictionnary, that you apply to the tokens object:
@@ -321,18 +326,6 @@ wordfreqs <- dfm.selected %>% textstat_frequency %>% as.data.table %>% setorder(
 ```
 
 That's it, your flexions are grouped and your list of distinct words (`wordfreqs`) is now a little shorter.
-
-```{r}
-if(FALSE){
-test <- udpipe("Je marchais devant moi, suivant les chemins de traverse et m'arrêtant le soir devant les auberges écartées",object = udmodel, parallel.cores = ncores) %>% 
-	as.data.table %>%
-	.[upos %in% c("NOUN","PROPN","ADJ","VERB"), c("doc_id","lemma")]
-test <- test[,.(text = paste(lemma, collapse=" ")), by = doc_id] 
-	test %>% corpus %>%
-	tokens(remove_punct=TRUE) %>%
-	tokens_remove(mystopwords)
-}
-```
 
 ### Visualize the frequencies
 
@@ -409,6 +402,7 @@ connections arbitrary.
 fcm.selected.symmetric <- Matrix::forceSymmetric(fcm.selected, uplo="U") # The matrix has to be made symmetric for igraph to be able to treat it as undirected
 fcm.selected.weighted <- fcm.selected / rowSums(fcm.selected.symmetric)^0.9
 fcm.selected.symmetric.weighted <- Matrix::forceSymmetric(fcm.selected.weighted, uplo="U")
+fcm.selected.symmetric <- fcm.selected.weighted <- NULL ; gc() # free up some memory
 ```
 
 ### Visualise the graph
@@ -646,13 +640,13 @@ co-occurrence = 3 for A and B, than the distance between A and B will be
 `1/0` which is undefined in arithmetics. In R, `1/0 = Inf`. MDS cannot
 work with infinity; we need to define actual values. So let us assign 0
 to the diagonal of the matrix (distance of words to themselves) and a
-large arbitrary number (`max(fcm.selected) * 3`) as the distance between
+large arbitrary number (`max(fcm.selected) * 10`) as the distance between
 words that never co-occur:
 
 ```{r}
 g.dist <- 1/fcm.selected.symmetric.weighted
 diag(g.dist) <- 0 # distance of a word to itself is always 0
-g.dist[g.dist==Inf] <- max(fcm.selected) * 3
+g.dist[g.dist==Inf] <- max(fcm.selected.symmetric.weighted) * 10
 ```
 
 You may notice that the operation above inflates the memory size of the
